@@ -6,14 +6,15 @@ A Go implementation of Rust's [evmap](https://github.com/jonhoo/evmap). This imp
 ## Usage
 ```go
 cache := eventual.NewMap[string, int]()
+reader := cache.Reader()
 
 // Insert a key
 cache.Insert("foo", 0)
-cache.Has("foo") // false
+reader.Has("foo") // false
 
 // Explicitly expose the current state of the map to the reads
 cache.Refresh()
-cache.Has("foo") // true
+reader.Has("foo") // true
 ```
 
 ## Why?
