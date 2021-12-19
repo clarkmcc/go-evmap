@@ -13,7 +13,7 @@ import (
 	"github.com/clarkmcc/go-evmap/pkg/oplog"
 	"sync"
 	"sync/atomic"
-	unsafe "unsafe"
+	"unsafe"
 )
 
 // Map is a generic hashmap that provides low-contention, concurrent access
@@ -39,67 +39,41 @@ type Map[K comparable, V any] struct {
 	// writer(s).
 	writable *map[K]*V
 
-	// This should be acquired as soon as we swap readable and writable pointers
+	// A slice of references to every reader that we need to monitor
+	readers     []*Reader[K, V]
+	readersLock sync.Mutex
+
+	// This should be acquired as soon as we swapLocked readable and writable pointers
 	// and should be released when we can prove that all readers are now looking
 	// at writable.
 	writeLock sync.Mutex
 
-	// Tracks the number of writes since the last refresh. This should also
-	// match the length of the oplog. It's access should always be guarded
-	// by writeLock.
-	replicationWriteLag int
-
-	// The number of writes that are allowed to occur without making them available
-	// to the readers.
-	maxReplicationWriteLag int
-
 	// Used for replicating writes to m.writable after it's just been swapped
 	// from m.readable
 	oplog *oplog.Log[K, V]
-
-	// Guards the initial setup processes and ensures that they only happen once
-	// and also allows this struct to be initialized with its zero value.
-	initOnce sync.Once
 }
 
-// init initializes the map with all the default fields.
-func (m *Map[K, V]) init() {
-	m.initOnce.Do(func() {
-		r := make(map[K]*V)
-		m.readable = &r
-		w := make(map[K]*V)
-		m.writable = &w
-		m.oplog = oplog.NewLog[K, V]()
-	})
-}
-
-// swap takes the pointers to the readable and writable maps and swaps them
+// swapLocked takes the pointers to the readable and writable maps and swaps them
 // so that the map that was previously used by the readers is now used by
 // the writers and the map that was previously written to by the writers is
 // now being read by the readers.
-func (m *Map[K, V]) swap() {
+func (m *Map[K, V]) swapLocked() {
 	readable := unsafe.Pointer(m.readable)
 	writable := unsafe.Pointer(m.writable)
 	m.readable = (*map[K]*V)(atomic.SwapPointer(&writable, readable))
 	m.writable = (*map[K]*V)(atomic.SwapPointer(&readable, writable))
 }
 
-// sync ensures that the value pointed to by m.readable is up-to-date with the
+// syncLocked ensures that the value pointed to by m.readable is up-to-date with the
 // value pointed to by m.writable. The only reason to call this function is after
-// first calling swap which causes the map that is most up to date (the map pointed
-// to by m.writable before the swap) to be switched to reader mode and the map
-// that is least up to date (the map pointed to by m.readable before the swap)
-// to be switched to writer mode. After performing the swap, we want to replicate
-// of our writes sync the previous sync to the map that is now (after the swap)
+// first calling swapLocked which causes the map that is most up to date (the map pointed
+// to by m.writable before the swapLocked) to be switched to reader mode and the map
+// that is least up to date (the map pointed to by m.readable before the swapLocked)
+// to be switched to writer mode. After performing the swapLocked, we want to replicate
+// of our writes syncLocked the previous syncLocked to the map that is now (after the swapLocked)
 // pointed to by m.writable.
-func (m *Map[K, V]) sync() {
-	// Writers should be unable to apply writes to the map while we're getting up
-	// to sync. This same lock protects the oplog from being modified since all
-	// modifications to this map are also applied to the oplog.
-	m.writeLock.Lock()
-	defer m.writeLock.Unlock()
-
-	// Clear the oplog after the sync because we don't want to re-apply the same
+func (m *Map[K, V]) syncLocked() {
+	// Clear the oplog after the syncLocked because we don't want to re-apply the same
 	// operations more than once.
 	defer m.oplog.Clear()
 
@@ -113,14 +87,36 @@ func (m *Map[K, V]) sync() {
 // writable map to be synced with the old writable map (now m.readable) using
 // an internal oplog.
 func (m *Map[K, V]) Refresh() {
-	m.swap()
-	m.sync()
-	m.replicationWriteLag = 0
+	// Writers should be unable to apply writes to the map while we're getting up
+	// to syncLocked. This same lock protects the oplog from being modified since all
+	// modifications to this map are also applied to the oplog.
+	m.writeLock.Lock()
+	defer m.writeLock.Unlock()
+
+	// Swap the readable and writable maps globally. This only swaps the pointers
+	// in this data structure, but does not touch any of the readers.
+	m.swapLocked()
+
+	// Swap each reader's readable pointer with the new readable pointer
+	for _, r := range m.readers {
+		r.swapReadable(m.readable)
+	}
+
+	// We can assume at this point that all readers are now looking at the new
+	// readable map which means the writable map is safe to perform writes against.
+	m.syncLocked()
+}
+
+func (m *Map[K, V]) Reader() *Reader[K, V] {
+	m.readersLock.Lock()
+	defer m.readersLock.Unlock()
+	r := NewReader(m)
+	m.readers = append(m.readers, r)
+	return r
 }
 
 func (m *Map[K, V]) Insert(key K, value *V) {
 	m.writeLock.Lock()
-	defer m.observeWrite()
 	defer m.writeLock.Unlock()
 
 	// This is a map modification so push the insert to the oplog and then apply
@@ -132,7 +128,6 @@ func (m *Map[K, V]) Insert(key K, value *V) {
 // whether the key existed.
 func (m *Map[K, V]) Delete(key K) bool {
 	m.writeLock.Lock()
-	defer m.observeWrite()
 	defer m.writeLock.Unlock()
 
 	// Check if the key exists before applying the deletion for obvious reasons
@@ -148,42 +143,19 @@ func (m *Map[K, V]) Delete(key K) bool {
 // not change the map pointer.
 func (m *Map[K, V]) Clear() {
 	m.writeLock.Lock()
-	defer m.observeWrite()
 	defer m.writeLock.Unlock()
 
 	m.oplog.PushAndApply(oplog.Clear[K, V](), m.writable)
 }
 
-// Has returns whether the map has the specified key
-func (m *Map[K, V]) Has(key K) bool {
-	_, ok := (*m.readable)[key]
-	return ok
-}
-
-// Get returns the value at the provided key. This will return a pointer to the
-// value at the key, as well as whether the key exists or not. It's possible to
-// add a nil value to the map, so this distinction is relevant.
-func (m *Map[K, V]) Get(key K) (*V, bool) {
-	v, ok := (*m.readable)[key]
-	return v, ok
-}
-
-// observeWrite observes a write and determines whether to refresh based on configuration
-func (m *Map[K, V]) observeWrite() {
-	m.replicationWriteLag++
-	if m.maxReplicationWriteLag > 0 && m.replicationWriteLag > m.maxReplicationWriteLag {
-		m.Refresh()
-	}
-}
-
 // NewMap creates a new Map of the given type with the provided options.
-func NewMap[K comparable, V any](options ...OptionFunc) *Map[K, V] {
-	m := Map[K, V]{}
-	m.init()
-	opts := Options{}
-	for _, fn := range options {
-		fn(&opts)
+func NewMap[K comparable, V any]() *Map[K, V] {
+	r := make(map[K]*V)
+	w := make(map[K]*V)
+	return &Map[K, V]{
+		readable: &r,
+		writable: &w,
+		readers:  []*Reader[K, V]{},
+		oplog:    oplog.NewLog[K, V](),
 	}
-	m.maxReplicationWriteLag = opts.MaxReplicationWriteLag
-	return &m
 }

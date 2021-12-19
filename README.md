@@ -1,4 +1,6 @@
 # go-evmap
+#### Note: this is not a production-ready data structure by any-means. It is currently a work-in-progress exploration of a left-right-backed concurrent map.
+
 A Go implementation of Rust's [evmap](https://github.com/jonhoo/evmap). This implementation is more of a naive implementation that does not support writer/reader handles and iterators, but this also means that the implementation is extremely simple (<200 lines). It has no direct dependencies.
 
 ## Usage

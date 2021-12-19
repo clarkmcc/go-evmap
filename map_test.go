@@ -34,21 +34,22 @@ func TestMap(t *testing.T) {
 		// But the writers have
 		assert.Len(t, *m.writable, 1)
 	})
-	t.Run("Has & Get", func(t *testing.T) {
-		v, ok := m.Get("foo")
+	t.Run("has & get", func(t *testing.T) {
+		reader := m.Reader()
+		v, ok := reader.Get("foo")
 
 		// Readers haven't seen this key deleted yet
 		assert.True(t, ok)
-		assert.True(t, m.Has("foo"))
+		assert.True(t, reader.Has("foo"))
 
 		// Run a refresh
 		m.Refresh()
 
 		// Readers should see the key missing now
-		v, ok = m.Get("foo")
+		v, ok = reader.Get("foo")
 		assert.Nil(t, v)
 		assert.False(t, ok)
-		assert.False(t, m.Has("foo"))
+		assert.False(t, reader.Has("foo"))
 	})
 	t.Run("Clear", func(t *testing.T) {
 		m.Clear()
@@ -64,15 +65,14 @@ func TestMap(t *testing.T) {
 }
 
 func TestMap_swap(t *testing.T) {
-	m := Map[string, any]{}
-	m.init()
+	m := NewMap[string, any]()
 
 	// Check the pointers
 	ptr1 := m.writable
 	ptr2 := m.readable
 
 	// Swap
-	m.swap()
+	m.swapLocked()
 
 	// Check the pointers again
 	assert.Equal(t, m.writable, ptr2)
@@ -80,8 +80,7 @@ func TestMap_swap(t *testing.T) {
 }
 
 func TestMap_sync(t *testing.T) {
-	m := Map[string, any]{}
-	m.init()
+	m := NewMap[string, any]()
 
 	// Add a value
 	m.Insert("foo", nil)
@@ -90,11 +89,11 @@ func TestMap_sync(t *testing.T) {
 	// Check the writable map
 	assert.Len(t, *m.writable, 1, "one value should have been written to writable")
 
-	// Perform the swap
-	m.swap()
+	// Perform the swapLocked
+	m.swapLocked()
 	assert.Len(t, *m.writable, 0, "writable has been swapped with readable and the new writable should be empty")
 
-	// Perform the sync
-	m.sync()
+	// Perform the syncLocked
+	m.syncLocked()
 	assert.Len(t, *m.writable, 1, "the new writable has been synced with the old writable and should have the inserted value")
 }
