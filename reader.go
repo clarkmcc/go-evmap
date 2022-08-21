@@ -35,6 +35,17 @@ func (r *Reader[K, V]) Has(key K) bool {
 	return ok
 }
 
+func (r *Reader[K, V]) Read() map[K]*V {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	if r.closed {
+		panic("reader closed")
+	}
+	m := (*((*map[K]*V)(r.readable)))
+	return m
+}
+
 // Close removes the reader from the map. The caller will not be able
 // to use the reader anymore. Reading after close will result in a panic
 func (r *Reader[K, V]) Close() {
